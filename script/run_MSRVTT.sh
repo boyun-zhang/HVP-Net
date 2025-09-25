@@ -1,7 +1,7 @@
-CUDA_VISIBLE_DEVICES=0 \
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
 python -m torch.distributed.launch \
 --master_port 2502 \
---nproc_per_node=1 \
+--nproc_per_node=4 \
 main_retrieval.py \
 --do_train 1 \
 --workers 8 \

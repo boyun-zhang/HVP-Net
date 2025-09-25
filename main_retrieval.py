@@ -98,8 +98,8 @@ def set_seed_logger(args):
     torch.backends.cudnn.deterministic = True
 
     if torch.cuda.is_available():
-        # torch.distributed.init_process_group(backend="nccl")
-        torch.distributed.init_process_group(backend="gloo")
+        torch.distributed.init_process_group(backend="nccl")
+        # torch.distributed.init_process_group(backend="gloo")
         torch.cuda.set_device(args.local_rank)
         args.device = torch.device("cuda", args.local_rank)
         args.world_size = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
@@ -343,95 +343,125 @@ def eval_epoch(args, model, test_dataloader, device):
         logger.warning("sentence num: {}, video num: {}".format(sentence_num_, video_num_))
 
     model.eval()
-    logger.info("Model begins to testing...")
 
-    ids_t, batch_mask_t, batch_feat_s, batch_feat_w = [], [], [], []
-    ids_v, batch_mask_v, batch_feat_f, batch_feat_p = [], [], [], []
+    local_s_feat_list, local_w_feat_list, local_t_mask_list = [], [], []
+    local_f_feat_list, local_p_feat_list, local_v_mask_list = [], [], []
 
+    logger.info(f"Rank {args.local_rank} starting feature extraction...")
     with torch.no_grad():
-        tic = time.time()
+        for batch in tqdm(test_dataloader, disable=not is_main_process()):
+            batch = tuple(t.to(device) for t in batch)
+            text, text_mask, video, video_mask, inds, index = batch
+            
+            s_feat, w_feat, f_feat, p_feat = model.get_text_video_feat(text, text_mask, video, video_mask)
+            
+            local_s_feat_list.append(s_feat)
+            local_w_feat_list.append(w_feat)
+            local_t_mask_list.append(text_mask)
+            
+            local_f_feat_list.append(f_feat)
+            local_p_feat_list.append(p_feat)
+            local_v_mask_list.append(video_mask)
+
+    # === Step 2: 使用all_gather在所有GPU上同步完整的特征张量 ===
+    # 这样每个GPU都拥有了整个测试集的数据，为并行计算做准备
+    synchronize()
+    
+    # --- Text Features ---
+    s_feat_gathered = allgather(torch.cat(local_s_feat_list, dim=0), args)
+    w_feat_gathered = allgather(torch.cat(local_w_feat_list, dim=0), args)
+    t_mask_gathered = allgather(torch.cat(local_t_mask_list, dim=0), args)
+    
+    # --- Video Features ---
+    # f_feat and p_feat are lists of tensors, we need to gather them layer by layer
+    f_feat_all_layers = list(zip(*[item for sublist in local_f_feat_list for item in sublist]))
+    f_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in f_feat_all_layers]
+    
+    p_feat_all_layers = list(zip(*[item for sublist in local_p_feat_list for item in sublist]))
+    p_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in p_feat_all_layers]
+    # f_feat_all_layers = list(zip(*local_f_feat_list)) if len(local_f_feat_list) > 0 else []
+    # f_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in f_feat_all_layers] if len(f_feat_all_layers) > 0 else []
+
+    # p_feat_all_layers = list(zip(*local_p_feat_list)) if len(local_p_feat_list) > 0 else []
+    # p_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in p_feat_all_layers] if len(p_feat_all_layers) > 0 else []
+    v_mask_gathered = allgather(torch.cat(local_v_mask_list, dim=0), args)
+    
+    if is_main_process():
+        logger.info("All features gathered across all GPUs.")
+        logger.info(f"Total text features: {s_feat_gathered.shape[0]}, Total video features: {v_mask_gathered.shape[0]}")
+
+    # === Step 3: 分布式计算相似度矩阵 ===
+    # 每个GPU计算一部分文本与所有视频的相似度
+    
+    # 获取当前进程的rank
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+
+    # 计算每个GPU需要处理的文本数量
+    total_texts = s_feat_gathered.shape[0]
+    texts_per_gpu = (total_texts + world_size - 1) // world_size
+    start_idx = rank * texts_per_gpu
+    end_idx = min(start_idx + texts_per_gpu, total_texts)
+
+    sim_matrix_chunk = []
+    if start_idx < end_idx:
+        # 获取当前GPU需要处理的文本特征块
+        t_mask_chunk = t_mask_gathered[start_idx:end_idx]
+        s_feat_chunk = s_feat_gathered[start_idx:end_idx]
+        w_feat_chunk = w_feat_gathered[start_idx:end_idx]
+        
+        # 使用完整的视频特征
+        v_mask_full = v_mask_gathered
+        f_feat_full = f_feat_gathered_layers
+        p_feat_full = p_feat_gathered_layers
+        
+        if is_main_process():
+            logger.info("Starting distributed similarity matrix computation...")
+        
+        with torch.no_grad():
+             # 调用原来的单GPU运行函数，但输入是数据块
+            sim_chunk = _run_on_single_gpu(model, t_mask_chunk, s_feat_chunk, w_feat_chunk, v_mask_full, f_feat_full, p_feat_full, args.split_batch)
+            sim_matrix_chunk = np.concatenate(tuple(sim_chunk), axis=0)
+
+    synchronize()
+
+    # === Step 4: 收集所有GPU计算的部分结果 ===
+    # 使用 all_gather_object 收集numpy数组
+    # make sure each rank provides a numpy array (possibly empty) so the gathered list has consistent types
+    if not isinstance(sim_matrix_chunk, np.ndarray):
+        total_videos = v_mask_gathered.shape[0]
+        sim_matrix_chunk = np.zeros((0, total_videos), dtype=np.float32)
+    gathered_chunks = [None] * world_size
+    torch.distributed.all_gather_object(gathered_chunks, sim_matrix_chunk)
+    
+    # === Step 5: 在主进程上拼接矩阵并计算指标 ===
+    if is_main_process():
+        logger.info("Similarity computation finished. Gathering results.")
+        # 过滤掉可能是空的块
+        gathered_chunks = [chunk for chunk in gathered_chunks if chunk is not None and chunk.shape[0] > 0]
+        sim_matrix = np.concatenate(gathered_chunks, axis=0)
+
+        logger.info("Final similarity matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
+        
+        # The rest of the metric calculation logic is the same
         if multi_sentence_:
-            total_video_num = 0
-            for batch in tqdm(test_dataloader):
-                batch = tuple(t.to(device) for t in batch)
-                text, text_mask, video, video_mask, inds, index = batch
-
-                b, *_t = video.shape
-                s_feat, w_feat = model.get_text_feat(text, text_mask)
-                ids_t.append(inds)
-                batch_mask_t.append(text_mask)
-                batch_feat_s.append(s_feat)
-                batch_feat_w.append(w_feat)
-
-                s_, e_ = total_video_num, total_video_num + b
-                filter_inds = [itm - s_ for itm in cut_off_points_ if itm >= s_ and itm < e_]
-
-                if len(filter_inds) > 0:
-                    vide, video_mask = video[filter_inds, ...], video_mask[filter_inds, ...]
-
-                    f_feat, p_feat = model.get_video_feat(video, video_mask)
-                    ids_v.append(inds)
-                    batch_feat_f.append(f_feat)
-                    batch_mask_v.append(video_mask)
-                    batch_feat_p.append(p_feat)
-                total_video_num += b
-
-            ids_t = torch.cat(ids_t, dim=0).squeeze()
-            ids_v = torch.cat(ids_v, dim=0).squeeze()
-            batch_mask_t = torch.cat(batch_mask_t, dim=0)
-            batch_feat_s = torch.cat(batch_feat_s, dim=0)
-            batch_feat_w = torch.cat(batch_feat_w, dim=0)
-            batch_mask_v = torch.cat(batch_mask_v, dim=0)
-            batch_feat_f = list(zip(*batch_feat_f))
-            batch_feat_p = list(zip(*batch_feat_p))
-            batch_feat_f = [torch.cat(layer_feats, dim=0) for layer_feats in batch_feat_f]
-            batch_feat_p = [torch.cat(layer_feats, dim=0) for layer_feats in batch_feat_p]
+            logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
+            cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
+            max_length = max([e_ - s_ for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_)])
+            sim_matrix_new = []
+            for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
+                sim_matrix_new.append(
+                    np.concatenate((sim_matrix[s_:e_], np.full((max_length - e_ + s_, sim_matrix.shape[1]), -np.inf)),
+                                   axis=0))
+            sim_matrix = np.stack(tuple(sim_matrix_new), axis=0)
+            logger.info("after reshape, sim matrix size: {} x {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1],
+                                                                              sim_matrix.shape[2]))
+            tv_metrics = tensor_text_to_video_metrics(sim_matrix)
+            vt_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix))
         else:
-            for batch in tqdm(test_dataloader):
-                batch = tuple(t.to(device) for t in batch)
-                text, text_mask, video, video_mask, inds, index = batch
-                s_feat, w_feat, f_feat, p_feat = model.get_text_video_feat(text, text_mask, video, video_mask)
-                ids_t.append(inds)
-                ids_v.append(inds)
-                batch_mask_t.append(text_mask)
-                batch_mask_v.append(video_mask)
-                batch_feat_s.append(s_feat)
-                batch_feat_w.append(w_feat)
-                batch_feat_f.append(f_feat)
-                batch_feat_p.append(p_feat)
-            ids_t = torch.cat(ids_t, dim=0).squeeze()
-            ids_v = torch.cat(ids_v, dim=0).squeeze()
-            batch_mask_t = torch.cat(batch_mask_t, dim=0)
-            batch_feat_s = torch.cat(batch_feat_s, dim=0)
-            batch_feat_w = torch.cat(batch_feat_w, dim=0)
-            batch_mask_v = torch.cat(batch_mask_v, dim=0)
-            batch_feat_f = list(zip(*batch_feat_f))
-            batch_feat_p = list(zip(*batch_feat_p))
-            batch_feat_f = [torch.cat(layer_feats, dim=0) for layer_feats in batch_feat_f]
-            batch_feat_p = [torch.cat(layer_feats, dim=0) for layer_feats in batch_feat_p]
-    toc1 = time.time()
-    with torch.no_grad():
-        sim_matrix = _run_on_single_gpu(model, batch_mask_t, batch_feat_s, batch_feat_w, batch_mask_v, batch_feat_f,
-                                        batch_feat_p, args.split_batch)
-        sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
-    toc2 = time.time()
-    if multi_sentence_:
-        logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
-        cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
-        max_length = max([e_ - s_ for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_)])
-        sim_matrix_new = []
-        for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
-            sim_matrix_new.append(
-                np.concatenate((sim_matrix[s_:e_], np.full((max_length - e_ + s_, sim_matrix.shape[1]), -np.inf)),
-                               axis=0))
-        sim_matrix = np.stack(tuple(sim_matrix_new), axis=0)
-        logger.info("after reshape, sim matrix size: {} x {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1],
-                                                                          sim_matrix.shape[2]))
-        tv_metrics = tensor_text_to_video_metrics(sim_matrix)
-        vt_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix))
-        toc3 = time.time()
-        logger.info(
-            "time profile: feat {:.1f}s match {:.5f}s metrics {:.5f}s".format(toc1 - tic, toc2 - toc1, toc3 - toc2))
+            tv_metrics = compute_metrics(sim_matrix)
+            vt_metrics = compute_metrics(sim_matrix.T)
+        
         tv_metrics['RSum'] = tv_metrics['R1'] + tv_metrics['R5'] + tv_metrics['R10']
         logger.info(
             "Text-to-Video: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
@@ -442,28 +472,132 @@ def eval_epoch(args, model, test_dataloader, device):
             "Video-to-Text: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
             format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['RSum'], vt_metrics['MR'],
                    vt_metrics['MeanR']))
+        
         return tv_metrics['R1']
+    
+    # 非主进程返回一个默认值
+    return 0.0
+    # logger.info("Model begins to testing...")
 
-    else:
-        logger.info("sim matrix size: {}, {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
-        tv_metrics = compute_metrics(sim_matrix)
-        vt_metrics = compute_metrics(sim_matrix.T)
-        logger.info('Length-T: {}, Length-V:{}'.format(len(sim_matrix), len(sim_matrix[0])))
-        logger.info('[end] compute_metrics')
-        toc3 = time.time()
-        logger.info(
-            "time profile: feat {:.1f}s match {:.5f}s metrics {:.5f}s".format(toc1 - tic, toc2 - toc1, toc3 - toc2))
-        tv_metrics['RSum'] = tv_metrics['R1'] + tv_metrics['R5'] + tv_metrics['R10']
-        logger.info(
-            "Text-to-Video: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
-            format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['RSum'], tv_metrics['MR'],
-                   tv_metrics['MeanR']))
-        vt_metrics['RSum'] = vt_metrics['R1'] + vt_metrics['R5'] + vt_metrics['R10']
-        logger.info(
-            "Video-to-Text: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
-            format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['RSum'], vt_metrics['MR'],
-                   vt_metrics['MeanR']))
-        return tv_metrics['R1']
+    # ids_t, batch_mask_t, batch_feat_s, batch_feat_w = [], [], [], []
+    # ids_v, batch_mask_v, batch_feat_f, batch_feat_p = [], [], [], []
+
+    # with torch.no_grad():
+    #     tic = time.time()
+    #     if multi_sentence_:
+    #         total_video_num = 0
+    #         for batch in tqdm(test_dataloader):
+    #             batch = tuple(t.to(device) for t in batch)
+    #             text, text_mask, video, video_mask, inds, index = batch
+
+    #             b, *_t = video.shape
+    #             s_feat, w_feat = model.get_text_feat(text, text_mask)
+    #             ids_t.append(inds)
+    #             batch_mask_t.append(text_mask)
+    #             batch_feat_s.append(s_feat)
+    #             batch_feat_w.append(w_feat)
+
+    #             s_, e_ = total_video_num, total_video_num + b
+    #             filter_inds = [itm - s_ for itm in cut_off_points_ if itm >= s_ and itm < e_]
+
+    #             if len(filter_inds) > 0:
+    #                 vide, video_mask = video[filter_inds, ...], video_mask[filter_inds, ...]
+
+    #                 f_feat, p_feat = model.get_video_feat(video, video_mask)
+    #                 ids_v.append(inds)
+    #                 batch_feat_f.append(f_feat)
+    #                 batch_mask_v.append(video_mask)
+    #                 batch_feat_p.append(p_feat)
+    #             total_video_num += b
+
+    #         ids_t = torch.cat(ids_t, dim=0).squeeze()
+    #         ids_v = torch.cat(ids_v, dim=0).squeeze()
+    #         batch_mask_t = torch.cat(batch_mask_t, dim=0)
+    #         batch_feat_s = torch.cat(batch_feat_s, dim=0)
+    #         batch_feat_w = torch.cat(batch_feat_w, dim=0)
+    #         batch_mask_v = torch.cat(batch_mask_v, dim=0)
+    #         batch_feat_f = list(zip(*batch_feat_f))
+    #         batch_feat_p = list(zip(*batch_feat_p))
+    #         batch_feat_f = [torch.cat(layer_feats, dim=0) for layer_feats in batch_feat_f]
+    #         batch_feat_p = [torch.cat(layer_feats, dim=0) for layer_feats in batch_feat_p]
+    #     else:
+    #         for batch in tqdm(test_dataloader):
+    #             batch = tuple(t.to(device) for t in batch)
+    #             text, text_mask, video, video_mask, inds, index = batch
+    #             s_feat, w_feat, f_feat, p_feat = model.get_text_video_feat(text, text_mask, video, video_mask)
+    #             ids_t.append(inds)
+    #             ids_v.append(inds)
+    #             batch_mask_t.append(text_mask)
+    #             batch_mask_v.append(video_mask)
+    #             batch_feat_s.append(s_feat)
+    #             batch_feat_w.append(w_feat)
+    #             batch_feat_f.append(f_feat)
+    #             batch_feat_p.append(p_feat)
+    #         ids_t = torch.cat(ids_t, dim=0).squeeze()
+    #         ids_v = torch.cat(ids_v, dim=0).squeeze()
+    #         batch_mask_t = torch.cat(batch_mask_t, dim=0)
+    #         batch_feat_s = torch.cat(batch_feat_s, dim=0)
+    #         batch_feat_w = torch.cat(batch_feat_w, dim=0)
+    #         batch_mask_v = torch.cat(batch_mask_v, dim=0)
+    #         batch_feat_f = list(zip(*batch_feat_f))
+    #         batch_feat_p = list(zip(*batch_feat_p))
+    #         batch_feat_f = [torch.cat(layer_feats, dim=0) for layer_feats in batch_feat_f]
+    #         batch_feat_p = [torch.cat(layer_feats, dim=0) for layer_feats in batch_feat_p]
+    # toc1 = time.time()
+    # with torch.no_grad():
+    #     sim_matrix = _run_on_single_gpu(model, batch_mask_t, batch_feat_s, batch_feat_w, batch_mask_v, batch_feat_f,
+    #                                     batch_feat_p, args.split_batch)
+    #     sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+    # toc2 = time.time()
+    # if multi_sentence_:
+    #     logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
+    #     cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
+    #     max_length = max([e_ - s_ for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_)])
+    #     sim_matrix_new = []
+    #     for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
+    #         sim_matrix_new.append(
+    #             np.concatenate((sim_matrix[s_:e_], np.full((max_length - e_ + s_, sim_matrix.shape[1]), -np.inf)),
+    #                            axis=0))
+    #     sim_matrix = np.stack(tuple(sim_matrix_new), axis=0)
+    #     logger.info("after reshape, sim matrix size: {} x {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1],
+    #                                                                       sim_matrix.shape[2]))
+    #     tv_metrics = tensor_text_to_video_metrics(sim_matrix)
+    #     vt_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix))
+    #     toc3 = time.time()
+    #     logger.info(
+    #         "time profile: feat {:.1f}s match {:.5f}s metrics {:.5f}s".format(toc1 - tic, toc2 - toc1, toc3 - toc2))
+    #     tv_metrics['RSum'] = tv_metrics['R1'] + tv_metrics['R5'] + tv_metrics['R10']
+    #     logger.info(
+    #         "Text-to-Video: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
+    #         format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['RSum'], tv_metrics['MR'],
+    #                tv_metrics['MeanR']))
+    #     vt_metrics['RSum'] = vt_metrics['R1'] + vt_metrics['R5'] + vt_metrics['R10']
+    #     logger.info(
+    #         "Video-to-Text: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
+    #         format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['RSum'], vt_metrics['MR'],
+    #                vt_metrics['MeanR']))
+    #     return tv_metrics['R1']
+
+    # else:
+    #     logger.info("sim matrix size: {}, {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
+    #     tv_metrics = compute_metrics(sim_matrix)
+    #     vt_metrics = compute_metrics(sim_matrix.T)
+    #     logger.info('Length-T: {}, Length-V:{}'.format(len(sim_matrix), len(sim_matrix[0])))
+    #     logger.info('[end] compute_metrics')
+    #     toc3 = time.time()
+    #     logger.info(
+    #         "time profile: feat {:.1f}s match {:.5f}s metrics {:.5f}s".format(toc1 - tic, toc2 - toc1, toc3 - toc2))
+    #     tv_metrics['RSum'] = tv_metrics['R1'] + tv_metrics['R5'] + tv_metrics['R10']
+    #     logger.info(
+    #         "Text-to-Video: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
+    #         format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['RSum'], tv_metrics['MR'],
+    #                tv_metrics['MeanR']))
+    #     vt_metrics['RSum'] = vt_metrics['R1'] + vt_metrics['R5'] + vt_metrics['R10']
+    #     logger.info(
+    #         "Video-to-Text: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
+    #         format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['RSum'], vt_metrics['MR'],
+    #                vt_metrics['MeanR']))
+    #     return tv_metrics['R1']
 
 
 def main():
@@ -538,7 +672,9 @@ def main():
         synchronize()
 
     elif args.do_eval:
-        eval_epoch(args, model, test_dataloader, args.device)
+        R1 = eval_epoch(args, model, test_dataloader, args.device)
+        if is_main_process():
+            logger.info("Evaluation finished. Text-to-Video R@1: {:.4f}".format(R1))
 
 
 if __name__ == "__main__":

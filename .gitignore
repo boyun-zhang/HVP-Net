@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# my ignore
+experiments/
+ActivityNet/
+Didemo/
+MSRVTT/
+models/ViT-B-32.pt
