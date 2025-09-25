@@ -80,7 +80,8 @@ def get_args(description='Text-Video Retrieval.'):
     parser.add_argument('--alpha', type=float, default=0.5, help='hyper-parameters alpha')
     parser.add_argument('--beta', type=float, default=0.5, help='hyper-parameters beta')
     parser.add_argument('--gamma', type=float, default=0.01, help='hyper-parameters gamma')
-
+    parser.add_argument('--resume_from', type=str, default=None,
+                            help="The checkpoint file path to resume training from.")
     args = parser.parse_args()
 
     return args
@@ -187,10 +188,10 @@ def prep_optimizer(args, model, num_train_optimization_steps, local_rank):
                          schedule='warmup_cosine', b1=0.9, b2=0.98, e=1e-6,
                          t_total=num_train_optimization_steps, weight_decay=weight_decay,
                          max_grad_norm=1.0)
-
-    if torch.cuda.is_available():
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,
-                                                          find_unused_parameters=True)
+    # Do not DDP package
+    # if torch.cuda.is_available():
+    #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,
+    #                                                       find_unused_parameters=True)
     return optimizer, scheduler, model
 
 
@@ -328,26 +329,26 @@ def eval_epoch(args, model, test_dataloader, device):
     else:
         model = model.to(device)
 
-    multi_sentence_ = False
-    cut_off_points_, sentence_num_, video_num_ = [], -1, -1
-    if hasattr(test_dataloader.dataset, 'multi_sentence_per_video') \
-            and test_dataloader.dataset.multi_sentence_per_video:
-        multi_sentence_ = True
-        cut_off_points_ = test_dataloader.dataset.cut_off_points
-        sentence_num_ = test_dataloader.dataset.sentence_num
-        video_num_ = test_dataloader.dataset.video_num
-        cut_off_points_ = [itm - 1 for itm in cut_off_points_]
+    # multi_sentence_ = False
+    # cut_off_points_, sentence_num_, video_num_ = [], -1, -1
+    # if hasattr(test_dataloader.dataset, 'multi_sentence_per_video') \
+    #         and test_dataloader.dataset.multi_sentence_per_video:
+    #     multi_sentence_ = True
+    #     cut_off_points_ = test_dataloader.dataset.cut_off_points
+    #     sentence_num_ = test_dataloader.dataset.sentence_num
+    #     video_num_ = test_dataloader.dataset.video_num
+    #     cut_off_points_ = [itm - 1 for itm in cut_off_points_]
 
-    if multi_sentence_:
-        logger.warning("Eval under the multi-sentence per video clip setting.")
-        logger.warning("sentence num: {}, video num: {}".format(sentence_num_, video_num_))
+    # if multi_sentence_:
+    #     logger.warning("Eval under the multi-sentence per video clip setting.")
+    #     logger.warning("sentence num: {}, video num: {}".format(sentence_num_, video_num_))
 
     model.eval()
 
     local_s_feat_list, local_w_feat_list, local_t_mask_list = [], [], []
     local_f_feat_list, local_p_feat_list, local_v_mask_list = [], [], []
-
-    logger.info(f"Rank {args.local_rank} starting feature extraction...")
+    if is_main_process():
+        logger.info(f"Rank {args.local_rank} starting feature extraction...")
     with torch.no_grad():
         for batch in tqdm(test_dataloader, disable=not is_main_process()):
             batch = tuple(t.to(device) for t in batch)
@@ -374,11 +375,22 @@ def eval_epoch(args, model, test_dataloader, device):
     
     # --- Video Features ---
     # f_feat and p_feat are lists of tensors, we need to gather them layer by layer
-    f_feat_all_layers = list(zip(*[item for sublist in local_f_feat_list for item in sublist]))
-    f_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in f_feat_all_layers]
+    # f_feat_all_layers = list(zip(*[item for sublist in local_f_feat_list for item in sublist]))
+    # f_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in f_feat_all_layers]
     
-    p_feat_all_layers = list(zip(*[item for sublist in local_p_feat_list for item in sublist]))
-    p_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in p_feat_all_layers]
+    # p_feat_all_layers = list(zip(*[item for sublist in local_p_feat_list for item in sublist]))
+    # p_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in p_feat_all_layers]
+    if local_f_feat_list:
+        f_feat_by_layer = list(zip(*local_f_feat_list))
+        f_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in f_feat_by_layer]
+    else:
+        f_feat_gathered_layers = []
+
+    if local_p_feat_list:
+        p_feat_by_layer = list(zip(*local_p_feat_list))
+        p_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in p_feat_by_layer]
+    else:
+        p_feat_gathered_layers = []
     # f_feat_all_layers = list(zip(*local_f_feat_list)) if len(local_f_feat_list) > 0 else []
     # f_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in f_feat_all_layers] if len(f_feat_all_layers) > 0 else []
 
@@ -388,7 +400,8 @@ def eval_epoch(args, model, test_dataloader, device):
     
     if is_main_process():
         logger.info("All features gathered across all GPUs.")
-        logger.info(f"Total text features: {s_feat_gathered.shape[0]}, Total video features: {v_mask_gathered.shape[0]}")
+        logger.info(f"Total text features gathered: {s_feat_gathered.shape[0]}")
+        logger.info(f"Total video features gathered: {v_mask_gathered.shape[0]}")
 
     # === Step 3: 分布式计算相似度矩阵 ===
     # 每个GPU计算一部分文本与所有视频的相似度
@@ -405,22 +418,17 @@ def eval_epoch(args, model, test_dataloader, device):
 
     sim_matrix_chunk = []
     if start_idx < end_idx:
-        # 获取当前GPU需要处理的文本特征块
         t_mask_chunk = t_mask_gathered[start_idx:end_idx]
         s_feat_chunk = s_feat_gathered[start_idx:end_idx]
         w_feat_chunk = w_feat_gathered[start_idx:end_idx]
         
-        # 使用完整的视频特征
-        v_mask_full = v_mask_gathered
-        f_feat_full = f_feat_gathered_layers
-        p_feat_full = p_feat_gathered_layers
-        
-        if is_main_process():
+        if rank == 0:
             logger.info("Starting distributed similarity matrix computation...")
         
         with torch.no_grad():
-             # 调用原来的单GPU运行函数，但输入是数据块
-            sim_chunk = _run_on_single_gpu(model, t_mask_chunk, s_feat_chunk, w_feat_chunk, v_mask_full, f_feat_full, p_feat_full, args.split_batch)
+            sim_chunk = _run_on_single_gpu(model, t_mask_chunk, s_feat_chunk, w_feat_chunk, 
+                                           v_mask_gathered, f_feat_gathered_layers, p_feat_gathered_layers, 
+                                           args.split_batch)
             sim_matrix_chunk = np.concatenate(tuple(sim_chunk), axis=0)
 
     synchronize()
@@ -436,14 +444,25 @@ def eval_epoch(args, model, test_dataloader, device):
     
     # === Step 5: 在主进程上拼接矩阵并计算指标 ===
     if is_main_process():
-        logger.info("Similarity computation finished. Gathering results.")
-        # 过滤掉可能是空的块
+        logger.info("Similarity computation finished. Gathering and finalizing results.")
+        
+        # 过滤掉空块并拼接
         gathered_chunks = [chunk for chunk in gathered_chunks if chunk is not None and chunk.shape[0] > 0]
+        if not gathered_chunks:
+            logger.error("No similarity chunks were gathered. Cannot compute metrics.")
+            return 0.0
+            
         sim_matrix = np.concatenate(gathered_chunks, axis=0)
-
         logger.info("Final similarity matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
         
-        # The rest of the metric calculation logic is the same
+        multi_sentence_ = False
+        if hasattr(test_dataloader.dataset, 'multi_sentence_per_video') and test_dataloader.dataset.multi_sentence_per_video:
+            multi_sentence_ = True
+            cut_off_points_ = test_dataloader.dataset.cut_off_points
+            cut_off_points_ = [itm - 1 for itm in cut_off_points_]
+            logger.warning("Eval under the multi-sentence per video clip setting.")
+            logger.warning(f"Sentence num: {test_dataloader.dataset.sentence_num}, Video num: {test_dataloader.dataset.video_num}")
+        
         if multi_sentence_:
             logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
             cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
@@ -451,11 +470,10 @@ def eval_epoch(args, model, test_dataloader, device):
             sim_matrix_new = []
             for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
                 sim_matrix_new.append(
-                    np.concatenate((sim_matrix[s_:e_], np.full((max_length - e_ + s_, sim_matrix.shape[1]), -np.inf)),
-                                   axis=0))
+                    np.concatenate((sim_matrix[s_:e_], np.full((max_length - e_ + s_, sim_matrix.shape[1]), -np.inf)), axis=0)
+                )
             sim_matrix = np.stack(tuple(sim_matrix_new), axis=0)
-            logger.info("after reshape, sim matrix size: {} x {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1],
-                                                                              sim_matrix.shape[2]))
+            logger.info("after reshape, sim matrix size: {} x {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1], sim_matrix.shape[2]))
             tv_metrics = tensor_text_to_video_metrics(sim_matrix)
             vt_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix))
         else:
@@ -465,17 +483,17 @@ def eval_epoch(args, model, test_dataloader, device):
         tv_metrics['RSum'] = tv_metrics['R1'] + tv_metrics['R5'] + tv_metrics['R10']
         logger.info(
             "Text-to-Video: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
-            format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['RSum'], tv_metrics['MR'],
-                   tv_metrics['MeanR']))
+            format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['RSum'], tv_metrics['MR'], tv_metrics['MeanR'])
+        )
         vt_metrics['RSum'] = vt_metrics['R1'] + vt_metrics['R5'] + vt_metrics['R10']
         logger.info(
             "Video-to-Text: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
-            format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['RSum'], vt_metrics['MR'],
-                   vt_metrics['MeanR']))
+            format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['RSum'], vt_metrics['MR'], vt_metrics['MeanR'])
+        )
         
         return tv_metrics['R1']
     
-    # 非主进程返回一个默认值
+    # 非主进程必须返回一个值，以保持函数签名一致
     return 0.0
     # logger.info("Model begins to testing...")
 
@@ -622,12 +640,43 @@ def main():
         tic = time.time()
         max_steps = len(train_dataloader) * args.epochs
         _max_steps = len(train_dataloader) * 5
-        optimizer, scheduler, model = prep_optimizer(args, model, _max_steps, args.local_rank)
 
+        # breakpoint setting
+        start_epoch = 0
+        global_step = 0
         best_score = 0.00001
         best_output_model_file = "None"
-        global_step = 0
-        logger.info("Model begins to training...")
+
+        # do not DDP
+        optimizer, scheduler, _ = prep_optimizer(args, model, _max_steps, args.local_rank)
+
+        if args.resume_from and exists(args.resume_from):
+            logger.info(f"Resuming training from checkpoint: {args.resume_from}")
+            checkpoint = torch.load(args.resume_from, map_location=args.device)
+            
+            start_epoch = checkpoint['epoch']
+            global_step = checkpoint['global_step']
+            
+            model.load_state_dict(checkpoint['state_dict'])
+            
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            
+            best_score = checkpoint['best_score']
+            
+            logger.info(f"Resumed from epoch {start_epoch}, global step {global_step}, best score {best_score}")
+
+            logger.info("Performing an evaluation on the resumed model before continuing training...")
+            if torch.cuda.is_available():
+                temp_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+            eval_epoch(args, temp_model, test_dataloader, args.device)
+            synchronize()
+            del temp_model 
+        
+        if torch.cuda.is_available():
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank,
+                                                              find_unused_parameters=True)
+        logger.info("Model begins to training...")        
+
         for epoch in range(args.epochs):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -642,20 +691,38 @@ def main():
             tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader,
                                                args.device, args.world_size, optimizer,
                                                scheduler, global_step, max_steps)
+            synchronize()
+
+            if args.local_rank == 0:
+                checkpoint_state = {
+                    'epoch': epoch + 1,
+                    'global_step': global_step,
+                    'state_dict': model.module.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'best_score': best_score,
+                }
+                output_checkpoint_file = join(args.output_dir, f"checkpoint_epoch_{epoch}.pth")
+                torch.save(checkpoint_state, output_checkpoint_file)
+                logger.info(f"Checkpoint for epoch {epoch} (training complete) saved to {output_checkpoint_file}")             
+
+            synchronize()
+
             torch.cuda.empty_cache()
             R1 = eval_epoch(args, model, test_dataloader, args.device)
             torch.cuda.empty_cache()
             synchronize()
-
             if args.local_rank == 0:
-                output_model_file = save_model(epoch, args, model, type_name="")
                 if best_score <= R1:
                     best_score = R1
-                    best_output_model_file = output_model_file
-                    torch.save(model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
-                               'best.pth')
-                logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
+                    best_output_model_file = output_checkpoint_file
+
+                    best_model_weights = torch.load(best_output_model_file, map_location='cpu')['state_dict']
+                    torch.save(best_model_weights, join(args.output_dir, 'best.pth'))
+
+                logger.info("The best model is from checkpoint: {}, current R1: {:.4f}, best R1: {:.4f}".format(best_output_model_file, R1, best_score))
+            
             synchronize()
+
         toc = time.time() - tic
         training_time = time.strftime("%Hh %Mmin %Ss", time.gmtime(toc))
         logger.info("*" * 20 + '\n' + f'training finished with {training_time}' + "*" * 20 + '\n')

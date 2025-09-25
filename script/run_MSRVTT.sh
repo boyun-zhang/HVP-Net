@@ -19,4 +19,4 @@ main_retrieval.py \
 --video_framerate 1 \
 --split_batch 8 \
 --output_dir experiments/MSRVTT
-
+--resume_from experiments/MSRVTT/2025-09-25_10:49:48/checkpoint_epoch_0.pth
