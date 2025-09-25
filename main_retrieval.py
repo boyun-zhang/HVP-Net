@@ -625,12 +625,28 @@ def main():
 
     meters = MetricLogger(delimiter="")
     args = get_args()
-    args.output_dir = args.output_dir + "/" + datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
-    if not exists(args.output_dir):
-        os.makedirs(args.output_dir, exist_ok=True)
-    logger = setup_logger('Model', args.output_dir, args.local_rank)
+    if args.resume_from and exists(args.resume_from):
+        args.output_dir = os.path.dirname(args.resume_from)
+    else:
+        args.output_dir = os.path.join(args.output_dir, datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S'))
+    temp_logger_path = os.path.join(os.path.dirname(args.output_dir), "temp_logs")
+    if not os.path.exists(temp_logger_path):
+        try:
+            os.makedirs(temp_logger_path, exist_ok=True)
+        except OSError:
+            pass
+    logger = setup_logger('Model_temp', temp_logger_path, 0) 
 
     args = set_seed_logger(args)
+
+    if is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
+        if os.path.exists(temp_logger_path):
+            import shutil
+            shutil.rmtree(temp_logger_path)
+            
+    synchronize() 
+    logger = setup_logger('Model', args.output_dir, args.local_rank)
 
     model = build_model(args)
 
