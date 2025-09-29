@@ -62,7 +62,13 @@ def get_args(description='Text-Video Retrieval.'):
     parser.add_argument("--device", default='cpu', type=str, help="cpu/cuda")
     parser.add_argument("--world_size", default=1, type=int, help="distribted training")
     # maybe you should set as --local_rank based on system.
-    parser.add_argument("--local-rank", default=0, type=int, help="distribted training")
+    parser.add_argument(
+        "--local_rank", "--local-rank",
+        dest="local_rank",
+        type=int,
+        default=int(os.environ.get("LOCAL_RANK", 0)),
+        help="local rank for DistributedDataParallel"
+    )    
     parser.add_argument("--distributed", default=0, type=int, help="multi machine DDP")
 
     parser.add_argument('--n_display', type=int, default=100, help='Information display frequence')
@@ -83,7 +89,6 @@ def get_args(description='Text-Video Retrieval.'):
     parser.add_argument('--resume_from', type=str, default=None,
                             help="The checkpoint file path to resume training from.")
     args = parser.parse_args()
-
     return args
 
 
@@ -97,26 +102,43 @@ def set_seed_logger(args):
     torch.cuda.manual_seed_all(args.seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+    use_cuda = torch.cuda.is_available()
+    using_dist = ("RANK" in os.environ and "WORLD_SIZE" in os.environ)
 
-    if torch.cuda.is_available():
-        torch.distributed.init_process_group(backend="nccl")
-        # torch.distributed.init_process_group(backend="gloo")
+    if use_cuda:
+        args.local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
         torch.cuda.set_device(args.local_rank)
         args.device = torch.device("cuda", args.local_rank)
-        args.world_size = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
-    if torch.cuda.is_available():
-        torch.distributed.barrier()
-    logger.info("local_rank: {} world_size: {}".format(args.local_rank, args.world_size))
+    else:
+        args.device = torch.device("cpu")
+        args.local_rank = 0
+    using_dist = ("RANK" in os.environ) and ("WORLD_SIZE" in os.environ)
 
-    if args.batch_size % args.world_size != 0 or args.batch_size_val % args.world_size != 0:
+    if use_cuda and using_dist and not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        args.world_size = torch.distributed.get_world_size()
+    else:
+        args.world_size = 1
+
+    # if torch.cuda.is_available():
+    #     torch.distributed.init_process_group(backend="nccl")
+    #     # torch.distributed.init_process_group(backend="gloo")
+    #     torch.cuda.set_device(args.local_rank)
+    #     args.device = torch.device("cuda", args.local_rank)
+    #     args.world_size = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    logger.info(f"local_rank: {args.local_rank} world_size: {args.world_size}")
+
+    if args.batch_size % max(1, args.world_size) != 0 or args.batch_size_val % max(1, args.world_size) != 0:
         raise ValueError(
-            "Invalid batch_size/batch_size_val and world_size parameter: {}%{} and {}%{}, should be == 0".format(
-                args.batch_size, args.world_size, args.batch_size_val, args.world_size))
+            f"Invalid batch_size/batch_size_val and world_size: "
+            f"{args.batch_size}%{args.world_size} and {args.batch_size_val}%{args.world_size}"
+        )
 
     logger.info("Effective parameters:")
     for key in sorted(args.__dict__):
-        logger.info("  <<< {}: {}".format(key, args.__dict__[key]))
-
+        logger.info(f"  <<< {key}: {args.__dict__[key]}")
     return args
 
 
@@ -230,18 +252,20 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         global_step += 1
         data_time = time.time() - end
 
-        if n_gpu == 1:
-            batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
+        # if n_gpu == 1:
+        #     batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
+        batch = tuple(t.to(device, non_blocking=True) for t in batch)
 
         text, text_mask, video, video_mask, idx, _ = batch
         loss = model(text, text_mask, video, video_mask, idx, global_step)
 
-        if n_gpu > 1:
-            loss = loss.mean()
+        # if n_gpu > 1:
+        #     loss = loss.mean()
 
-        with torch.autograd.detect_anomaly():
-            loss.backward()
-
+        # with torch.autograd.detect_anomaly():
+        #     loss.backward()
+        optimizer.zero_grad()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
         optimizer.step()
@@ -249,7 +273,12 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         if scheduler is not None:
             scheduler.step()
 
-        optimizer.zero_grad()
+        # optimizer.zero_grad()
+        with torch.no_grad():
+            reduced_l = loss.detach().clone()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(reduced_l, op=torch.distributed.ReduceOp.SUM)
+                reduced_l /= args.world_size
 
         if hasattr(model, 'module'):
             torch.clamp_(model.module.clip.logit_scale.data, max=np.log(100))
@@ -261,7 +290,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         batch_time = time.time() - end
         end = time.time()
 
-        reduced_l = reduce_loss(loss, args)
+        # reduced_l = reduce_loss(loss, args)
         meters.update(time=batch_time, data=data_time, loss=float(reduced_l))
 
         eta_seconds = meters.time.global_avg * (max_steps - global_step)
@@ -347,31 +376,60 @@ def eval_epoch(args, model, test_dataloader, device):
 
     local_s_feat_list, local_w_feat_list, local_t_mask_list = [], [], []
     local_f_feat_list, local_p_feat_list, local_v_mask_list = [], [], []
+    local_inds_list = []
+
     if is_main_process():
         logger.info(f"Rank {args.local_rank} starting feature extraction...")
     with torch.no_grad():
         for batch in tqdm(test_dataloader, disable=not is_main_process()):
             batch = tuple(t.to(device) for t in batch)
             text, text_mask, video, video_mask, inds, index = batch
-            
+
             s_feat, w_feat, f_feat, p_feat = model.get_text_video_feat(text, text_mask, video, video_mask)
-            
+
             local_s_feat_list.append(s_feat)
             local_w_feat_list.append(w_feat)
             local_t_mask_list.append(text_mask)
-            
             local_f_feat_list.append(f_feat)
             local_p_feat_list.append(p_feat)
             local_v_mask_list.append(video_mask)
+            local_inds_list.append(inds)
 
+    synchronize()
+    def cat_(lst): return torch.cat(lst, dim=0) if len(lst) > 0 else None
+    s_feat_local = cat_(local_s_feat_list)
+    w_feat_local = cat_(local_w_feat_list)
+    t_mask_local = cat_(local_t_mask_list)
+    v_mask_local = cat_(local_v_mask_list)
+    inds_local   = cat_(local_inds_list)
     # === Step 2: 使用all_gather在所有GPU上同步完整的特征张量 ===
     # 这样每个GPU都拥有了整个测试集的数据，为并行计算做准备
+    if len(local_f_feat_list) > 0:
+        f_feat_by_layer_local = list(zip(*local_f_feat_list))  # list[tensor(B, F, D)]
+        p_feat_by_layer_local = list(zip(*local_p_feat_list))
+    else:
+        f_feat_by_layer_local, p_feat_by_layer_local = [], []
+    s_feat_all = allgather(s_feat_local, args)
+    w_feat_all = allgather(w_feat_local, args)
+    t_mask_all = allgather(t_mask_local, args)
+    v_mask_all = allgather(v_mask_local, args)
+    inds_all   = allgather(inds_local, args).view(-1)  # [N]
+
+    f_feat_all_layers = [allgather(torch.cat(layer, dim=0), args) for layer in f_feat_by_layer_local] if f_feat_by_layer_local else []
+    p_feat_all_layers = [allgather(torch.cat(layer, dim=0), args) for layer in p_feat_by_layer_local] if p_feat_by_layer_local else []
+    order = torch.argsort(inds_all)
+    s_feat_all = s_feat_all[order]
+    w_feat_all = w_feat_all[order]
+    t_mask_all = t_mask_all[order]
+    v_mask_all = v_mask_all[order]
+    f_feat_all_layers = [x[order] for x in f_feat_all_layers]
+    p_feat_all_layers = [x[order] for x in p_feat_all_layers]
+
     synchronize()
-    
     # --- Text Features ---
-    s_feat_gathered = allgather(torch.cat(local_s_feat_list, dim=0), args)
-    w_feat_gathered = allgather(torch.cat(local_w_feat_list, dim=0), args)
-    t_mask_gathered = allgather(torch.cat(local_t_mask_list, dim=0), args)
+    # s_feat_gathered = allgather(torch.cat(local_s_feat_list, dim=0), args)
+    # w_feat_gathered = allgather(torch.cat(local_w_feat_list, dim=0), args)
+    # t_mask_gathered = allgather(torch.cat(local_t_mask_list, dim=0), args)
     
     # --- Video Features ---
     # f_feat and p_feat are lists of tensors, we need to gather them layer by layer
@@ -380,67 +438,67 @@ def eval_epoch(args, model, test_dataloader, device):
     
     # p_feat_all_layers = list(zip(*[item for sublist in local_p_feat_list for item in sublist]))
     # p_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in p_feat_all_layers]
-    if local_f_feat_list:
-        f_feat_by_layer = list(zip(*local_f_feat_list))
-        f_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in f_feat_by_layer]
-    else:
-        f_feat_gathered_layers = []
+    # if local_f_feat_list:
+    #     f_feat_by_layer = list(zip(*local_f_feat_list))
+    #     f_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in f_feat_by_layer]
+    # else:
+    #     f_feat_gathered_layers = []
 
-    if local_p_feat_list:
-        p_feat_by_layer = list(zip(*local_p_feat_list))
-        p_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in p_feat_by_layer]
-    else:
-        p_feat_gathered_layers = []
+    # if local_p_feat_list:
+    #     p_feat_by_layer = list(zip(*local_p_feat_list))
+    #     p_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in p_feat_by_layer]
+    # else:
+    #     p_feat_gathered_layers = []
     # f_feat_all_layers = list(zip(*local_f_feat_list)) if len(local_f_feat_list) > 0 else []
     # f_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in f_feat_all_layers] if len(f_feat_all_layers) > 0 else []
 
     # p_feat_all_layers = list(zip(*local_p_feat_list)) if len(local_p_feat_list) > 0 else []
     # p_feat_gathered_layers = [allgather(torch.cat(layer_feats, dim=0), args) for layer_feats in p_feat_all_layers] if len(p_feat_all_layers) > 0 else []
-    v_mask_gathered = allgather(torch.cat(local_v_mask_list, dim=0), args)
+    # v_mask_gathered = allgather(torch.cat(local_v_mask_list, dim=0), args)
     
-    if is_main_process():
-        logger.info("All features gathered across all GPUs.")
-        logger.info(f"Total text features gathered: {s_feat_gathered.shape[0]}")
-        logger.info(f"Total video features gathered: {v_mask_gathered.shape[0]}")
+    # if is_main_process():
+    #     logger.info("All features gathered across all GPUs.")
+    #     logger.info(f"Total text features gathered: {s_feat_gathered.shape[0]}")
+    #     logger.info(f"Total video features gathered: {v_mask_gathered.shape[0]}")
 
-    # === Step 3: 分布式计算相似度矩阵 ===
-    # 每个GPU计算一部分文本与所有视频的相似度
+    # # === Step 3: 分布式计算相似度矩阵 ===
+    # # 每个GPU计算一部分文本与所有视频的相似度
     
-    # 获取当前进程的rank
-    world_size = torch.distributed.get_world_size()
-    rank = torch.distributed.get_rank()
+    # # 获取当前进程的rank
+    # world_size = torch.distributed.get_world_size()
+    # rank = torch.distributed.get_rank()
 
-    # 计算每个GPU需要处理的文本数量
-    total_texts = s_feat_gathered.shape[0]
-    texts_per_gpu = (total_texts + world_size - 1) // world_size
-    start_idx = rank * texts_per_gpu
-    end_idx = min(start_idx + texts_per_gpu, total_texts)
+    # # 计算每个GPU需要处理的文本数量
+    # total_texts = s_feat_gathered.shape[0]
+    # texts_per_gpu = (total_texts + world_size - 1) // world_size
+    # start_idx = rank * texts_per_gpu
+    # end_idx = min(start_idx + texts_per_gpu, total_texts)
 
-    sim_matrix_chunk = []
-    if start_idx < end_idx:
-        t_mask_chunk = t_mask_gathered[start_idx:end_idx]
-        s_feat_chunk = s_feat_gathered[start_idx:end_idx]
-        w_feat_chunk = w_feat_gathered[start_idx:end_idx]
+    # sim_matrix_chunk = []
+    # if start_idx < end_idx:
+    #     t_mask_chunk = t_mask_gathered[start_idx:end_idx]
+    #     s_feat_chunk = s_feat_gathered[start_idx:end_idx]
+    #     w_feat_chunk = w_feat_gathered[start_idx:end_idx]
         
-        if rank == 0:
-            logger.info("Starting distributed similarity matrix computation...")
+    #     if rank == 0:
+    #         logger.info("Starting distributed similarity matrix computation...")
         
-        with torch.no_grad():
-            sim_chunk = _run_on_single_gpu(model, t_mask_chunk, s_feat_chunk, w_feat_chunk, 
-                                           v_mask_gathered, f_feat_gathered_layers, p_feat_gathered_layers, 
-                                           args.split_batch)
-            sim_matrix_chunk = np.concatenate(tuple(sim_chunk), axis=0)
+    #     with torch.no_grad():
+    #         sim_chunk = _run_on_single_gpu(model, t_mask_chunk, s_feat_chunk, w_feat_chunk, 
+    #                                        v_mask_gathered, f_feat_gathered_layers, p_feat_gathered_layers, 
+    #                                        args.split_batch)
+    #         sim_matrix_chunk = np.concatenate(tuple(sim_chunk), axis=0)
 
-    synchronize()
+    # synchronize()
 
     # === Step 4: 收集所有GPU计算的部分结果 ===
     # 使用 all_gather_object 收集numpy数组
     # make sure each rank provides a numpy array (possibly empty) so the gathered list has consistent types
-    if not isinstance(sim_matrix_chunk, np.ndarray):
-        total_videos = v_mask_gathered.shape[0]
-        sim_matrix_chunk = np.zeros((0, total_videos), dtype=np.float32)
-    gathered_chunks = [None] * world_size
-    torch.distributed.all_gather_object(gathered_chunks, sim_matrix_chunk)
+    # if not isinstance(sim_matrix_chunk, np.ndarray):
+    #     total_videos = v_mask_gathered.shape[0]
+    #     sim_matrix_chunk = np.zeros((0, total_videos), dtype=np.float32)
+    # gathered_chunks = [None] * world_size
+    # torch.distributed.all_gather_object(gathered_chunks, sim_matrix_chunk)
     
     # === Step 5: 在主进程上拼接矩阵并计算指标 ===
     if is_main_process():
@@ -452,7 +510,13 @@ def eval_epoch(args, model, test_dataloader, device):
             logger.error("No similarity chunks were gathered. Cannot compute metrics.")
             return 0.0
             
-        sim_matrix = np.concatenate(gathered_chunks, axis=0)
+        sim_matrix = _run_on_single_gpu(
+            model,
+            t_mask_all, s_feat_all, w_feat_all,
+            v_mask_all, f_feat_all_layers, p_feat_all_layers,
+            split_batch=args.split_batch
+        )
+        sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
         logger.info("Final similarity matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
         
         multi_sentence_ = False
@@ -481,16 +545,13 @@ def eval_epoch(args, model, test_dataloader, device):
             vt_metrics = compute_metrics(sim_matrix.T)
         
         tv_metrics['RSum'] = tv_metrics['R1'] + tv_metrics['R5'] + tv_metrics['R10']
-        logger.info(
-            "Text-to-Video: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
-            format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['RSum'], tv_metrics['MR'], tv_metrics['MeanR'])
-        )
+        logger.info("Text-to-Video: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".format(
+            tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['RSum'], tv_metrics['MR'], tv_metrics['MeanR']
+        ))
         vt_metrics['RSum'] = vt_metrics['R1'] + vt_metrics['R5'] + vt_metrics['R10']
-        logger.info(
-            "Video-to-Text: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".
-            format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['RSum'], vt_metrics['MR'], vt_metrics['MeanR'])
-        )
-        
+        logger.info("Video-to-Text: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@Sum: {:.1f} - MdR: {:.1f} - MnR: {:.1f}".format(
+            vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['RSum'], vt_metrics['MR'], vt_metrics['MeanR']
+        ))
         return tv_metrics['R1']
     
     # 非主进程必须返回一个值，以保持函数签名一致
@@ -733,13 +794,18 @@ def main():
         toc = time.time() - tic
         training_time = time.strftime("%Hh %Mmin %Ss", time.gmtime(toc))
         logger.info("*" * 20 + '\n' + f'training finished with {training_time}' + "*" * 20 + '\n')
-
-        model = model.module
-        if args.local_rank == 0:
-            model.load_state_dict(torch.load(best_output_model_file, map_location='cpu'), strict=False)
         if torch.cuda.is_available():
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
-                                                              find_unused_parameters=True)
+            torch.distributed.barrier()
+        best_state = torch.load(join(args.output_dir, 'best.pth'), map_location='cpu')
+        if hasattr(model, 'module'):
+            model.module.load_state_dict(best_state, strict=False)
+        else:
+            model.load_state_dict(best_state, strict=False)
+        # if args.local_rank == 0:
+        #     model.load_state_dict(torch.load(best_output_model_file, map_location='cpu'), strict=False)
+        # if torch.cuda.is_available():
+        #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
+        #                                                       find_unused_parameters=True)
 
         torch.cuda.empty_cache()
         eval_epoch(args, model, test_dataloader, args.device)

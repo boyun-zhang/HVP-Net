@@ -168,29 +168,19 @@ class MyModel(nn.Module):
         s_feat, w_feat, f_feat_list, p_feat_list = self.get_text_video_feat(text, text_mask, video, video_mask, shaped=True)
 
         if self.training:
-            # <<< --- 开始修改 --- >>>
-            # 步骤 1: 将所有GPU上的特征收集起来。这是正确的，因为对比损失需要在全局范围内计算正负样本。
-            if torch.cuda.is_available() and self.config.world_size > 1:
+            if torch.cuda.is_available():
+                idx = allgather(idx, self.config)
+                text_mask = allgather(text_mask, self.config)
                 s_feat = allgather(s_feat, self.config)
                 w_feat = allgather(w_feat, self.config)
-                # f_feat_list 和 p_feat_list 是特征列表，需要逐个收集
-                gathered_f_feat_list = []
-                for f_feat in f_feat_list:
-                    gathered_f_feat = allgather(f_feat, self.config)
-                    gathered_f_feat_list.append(gathered_f_feat)
-                f_feat_list = gathered_f_feat_list
-
-                gathered_p_feat_list = []
-                for p_feat in p_feat_list:
-                    gathered_p_feat = allgather(p_feat, self.config)
-                    gathered_p_feat_list.append(gathered_p_feat)
-                p_feat_list = gathered_p_feat_list
+                video_mask = allgather(video_mask, self.config)
+                f_feat_list = [allgather(x, self.config) for x in f_feat_list]
+                p_feat_list = [allgather(x, self.config) for x in p_feat_list]
                 torch.distributed.barrier()
 
-            # 注意：我们不再收集 idx, text_mask, video_mask，因为它们不直接参与跨GPU的损失计算
-            # idx 的作用是定义正样本对，这可以通过 allgather 后的特征顺序隐式保证
-
-            # 步骤 2: 计算损失。这里的特征已经是全局的了。
+            idx = idx.view(-1, 1)
+            idx_all = idx.t()
+            pos_idx = torch.eq(idx, idx_all).float()
             logit_scale = self.clip.logit_scale.exp()
             total_loss = 0.
             loss_wp, loss_sp, loss_sf = 0., 0., 0.
@@ -207,8 +197,7 @@ class MyModel(nn.Module):
                 p2w_logits, _ = sims_wp.max(dim=-2)
                 p2w_logits = torch.einsum('abp,bp->ab', [p2w_logits, p_feat_w])
                 sims_wp = (w2p_logits + p2w_logits) / 2.0
-                # 使用 self.loss_fct 计算对比损失，它内部应该处理对角线为正样本的情况
-                loss_sims_wp = self.loss_fct(sims_wp * logit_scale)
+                loss_sims_wp = self.loss_fct(sims_wp * logit_scale) + self.loss_fct(sims_wp.T * logit_scale)
                 loss_wp += loss_sims_wp
 
             # s_feat & p_feat_list
@@ -216,7 +205,7 @@ class MyModel(nn.Module):
                 p_feat_w = self.p_feat_w(p_feat).squeeze(-1)
                 sims_sp = torch.einsum('ad,bpd->abp', [self.norm(s_feat), self.norm(p_feat)])
                 sims_sp = torch.einsum('abp,bp->ab', [sims_sp, p_feat_w])
-                loss_sims_sp = self.loss_fct(sims_sp * logit_scale)
+                loss_sims_sp = self.loss_fct(sims_sp * logit_scale) + self.loss_fct(sims_sp.T * logit_scale)
                 loss_sp += loss_sims_sp
 
             # s_feat & f_feat_list
@@ -224,11 +213,9 @@ class MyModel(nn.Module):
                 f_feat_w = self.f_feat_w(f_feat).squeeze(-1)
                 sims_sf = torch.einsum('ad,bfd->abf', [self.norm(s_feat), self.norm(f_feat)])
                 sims_sf = torch.einsum('abf,bf->ab', [sims_sf, f_feat_w])
-                loss_sims_sf = self.loss_fct(sims_sf * logit_scale)
+                loss_sims_sf = self.loss_fct(sims_sf * logit_scale) + self.loss_fct(sims_sf.T * logit_scale)
                 loss_sf += loss_sims_sf
-            
-            # 步骤 3: 聚合损失并返回。
-            # 论文中是三者相加，我们遵循这个原则
+
             total_loss = loss_wp + loss_sp + loss_sf
 
             return total_loss
