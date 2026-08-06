@@ -1,5 +1,8 @@
 #!/bin/bash
+# E0: local baseline re-run, ViT-B/32 (12 layers), layer selection {1,6,12} -> 0,5,11
 PYTHON_ENV=/home/boyun/miniconda3/envs/retrieval/bin
+
+cd "$(dirname "$0")/.." || exit 1
 
 CUDA_VISIBLE_DEVICES=0 \
 $PYTHON_ENV/python main_retrieval.py \
@@ -18,5 +21,6 @@ $PYTHON_ENV/python main_retrieval.py \
 --max_frames 12 \
 --video_framerate 1 \
 --split_batch 8 \
---output_dir experiments/MSRVTT \
-# --resume_from experiments/MSRVTT/2025-09-25_10\:49\:48/checkpoint_epoch_0.pth
+--base_encoder ViT-B/32 \
+--layer_list 0,5,11 \
+--output_dir experiments/MSRVTT

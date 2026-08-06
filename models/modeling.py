@@ -58,7 +58,8 @@ class MyModel(nn.Module):
         transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
 
         self.clip = CLIP(embed_dim, image_resolution, vision_layers, vision_width, vision_patch_size,
-                         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers)
+                         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers,
+                         layer_list=getattr(config, 'layer_list', None))
 
         if torch.cuda.is_available():
             convert_weights(self.clip)
@@ -114,6 +115,10 @@ class MyModel(nn.Module):
         self.loss_fct = CrossEn(config)
         self.embed_dim = state_dict["text_projection"].shape[1]
         self.PatchListProcessing = PatchProcessing(embed_dim=self.embed_dim, sample_ratio=0.5, num_heads=8, k=3, num_blocks=3)
+
+        if getattr(config, 'grad_ckpt', 0):
+            self.clip.visual.transformer.grad_ckpt = True
+            self.PatchListProcessing.grad_ckpt = True
 
         self.p_feat_w = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
@@ -207,8 +212,7 @@ class MyModel(nn.Module):
                 p2w_logits, _ = sims_wp.max(dim=-2)
                 p2w_logits = torch.einsum('abp,bp->ab', [p2w_logits, p_feat_w])
                 sims_wp = (w2p_logits + p2w_logits) / 2.0
-                # 使用 self.loss_fct 计算对比损失，它内部应该处理对角线为正样本的情况
-                loss_sims_wp = self.loss_fct(sims_wp * logit_scale)
+                loss_sims_wp = self.loss_fct(sims_wp * logit_scale) + self.loss_fct(sims_wp.T * logit_scale)
                 loss_wp += loss_sims_wp
 
             # s_feat & p_feat_list
@@ -216,7 +220,7 @@ class MyModel(nn.Module):
                 p_feat_w = self.p_feat_w(p_feat).squeeze(-1)
                 sims_sp = torch.einsum('ad,bpd->abp', [self.norm(s_feat), self.norm(p_feat)])
                 sims_sp = torch.einsum('abp,bp->ab', [sims_sp, p_feat_w])
-                loss_sims_sp = self.loss_fct(sims_sp * logit_scale)
+                loss_sims_sp = self.loss_fct(sims_sp * logit_scale) + self.loss_fct(sims_sp.T * logit_scale)
                 loss_sp += loss_sims_sp
 
             # s_feat & f_feat_list
@@ -224,7 +228,7 @@ class MyModel(nn.Module):
                 f_feat_w = self.f_feat_w(f_feat).squeeze(-1)
                 sims_sf = torch.einsum('ad,bfd->abf', [self.norm(s_feat), self.norm(f_feat)])
                 sims_sf = torch.einsum('abf,bf->ab', [sims_sf, f_feat_w])
-                loss_sims_sf = self.loss_fct(sims_sf * logit_scale)
+                loss_sims_sf = self.loss_fct(sims_sf * logit_scale) + self.loss_fct(sims_sf.T * logit_scale)
                 loss_sf += loss_sims_sf
             
             # 步骤 3: 聚合损失并返回。
@@ -301,14 +305,16 @@ class MyModel(nn.Module):
 
         return s_feat.squeeze(1), w_feat, f_feat_list, p_feat_list
 
-    def get_similarity_logits(self, text_mask, s_feat, w_feat, video_mask, f_feat_list, p_feat_list, shaped=False):
+    def get_similarity_logits(self, text_mask, s_feat, w_feat, video_mask, f_feat_list, p_feat_list, shaped=False,
+                              p_feat_processed=False):
         if shaped is False:
             text_mask = text_mask.view(-1, text_mask.shape[-1])
             video_mask = video_mask.view(-1, video_mask.shape[-1])
 
         sims = 0.
 
-        p_feat_list = self.PatchListProcessing(p_feat_list)
+        if not p_feat_processed:
+            p_feat_list = self.PatchListProcessing(p_feat_list)
         # w_feat & p_feat_list
         w_feat_w = self.w_feat_w(w_feat).squeeze(-1)
         for p_feat in p_feat_list:

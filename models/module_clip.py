@@ -255,24 +255,27 @@ class ResidualAttentionBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int, attn_mask=None):
+    def __init__(self, width: int, layers: int, heads: int, attn_mask=None, layer_list=None):
         super(Transformer, self).__init__()
         self.width = width
         self.layers = layers
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.layer_list = [0, 5, 11] if layer_list is None else layer_list
+        self.grad_ckpt = False
 
     def forward(self, x: torch.Tensor):
-        layer_list = [11] # layers1/6/12
         mid_x = []
         for idx, layer in enumerate(self.resblocks):
-            x = layer(x)
-            if idx in layer_list:
+            if self.grad_ckpt and self.training:
+                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+            if idx in self.layer_list:
                 mid_x.append(x)
         return mid_x
-        # return self.resblocks(x)
 
 class VisualTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, layer_list=None):
         super(VisualTransformer, self).__init__()
         self.input_resolution = input_resolution
         self.output_dim = output_dim
@@ -284,7 +287,7 @@ class VisualTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
 
-        self.transformer = Transformer(width, layers, heads)
+        self.transformer = Transformer(width, layers, heads, layer_list=layer_list)
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
@@ -322,7 +325,8 @@ class CLIP(nn.Module):
                  vocab_size: int,
                  transformer_width: int,
                  transformer_heads: int,
-                 transformer_layers: int
+                 transformer_layers: int,
+                 layer_list=None
                  ):
         super(CLIP, self).__init__()
 
@@ -346,6 +350,7 @@ class CLIP(nn.Module):
                 layers=vision_layers,
                 heads=vision_heads,
                 output_dim=embed_dim,
+                layer_list=layer_list,
             )
 
         self.transformer = TransformerClip(

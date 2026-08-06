@@ -212,3 +212,15 @@ ActivityNet/
 Didemo/
 MSRVTT/
 models/ViT-B-32.pt
+models/ViT-B-16.pt
+models/ViT-L-14.pt
+
+paper/
+
+TODO.md
+
+Author_guideline.pdf
+
+.vscode
+
+datasets/

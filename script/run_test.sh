@@ -11,8 +11,8 @@ main_retrieval.py \
 --coef_lr 1e-3 \
 --batch_size 32 \
 --batch_size_val 32 \
---anno_path MSRVTT \
---video_path MSRVTT/videos \
+--anno_path datasets/MSR-VTT/raw_data \
+--video_path datasets/MSR-VTT/videos \
 --datatype msrvtt \
 --max_words 24 \
 --max_frames 12 \

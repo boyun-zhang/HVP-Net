@@ -76,6 +76,8 @@ def get_args(description='Text-Video Retrieval.'):
                         help="The output directory where the model predictions and checkpoints will be written.")
     # base_encoder = ["ViT-B/32", "ViT-B/16"]
     parser.add_argument("--base_encoder", type=str, default="ViT-B/32", help="Choose a CLIP version")
+    parser.add_argument('--layer_list', type=str, default="0,5,11",
+                        help="Visual transformer intermediate layers to extract (paper: layers 1/6/12 -> 0,5,11)")
     parser.add_argument('--agg_module', type=str, default="seqTransf", choices=["None", "seqLSTM", "seqTransf"],
                         help="choice a feature aggregation module for video.")
     parser.add_argument('--interaction', type=str, default='wti', help="interaction type for retrieval.")
@@ -88,7 +90,10 @@ def get_args(description='Text-Video Retrieval.'):
     parser.add_argument('--gamma', type=float, default=0.01, help='hyper-parameters gamma')
     parser.add_argument('--resume_from', type=str, default=None,
                             help="The checkpoint file path to resume training from.")
+    parser.add_argument('--grad_ckpt', type=int, default=0,
+                        help="Enable gradient checkpointing for visual transformer and MPP to save memory.")
     args = parser.parse_args()
+    args.layer_list = [int(x) for x in args.layer_list.split(",") if x.strip() != ""]
     return args
 
 
@@ -329,6 +334,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
 def _run_on_single_gpu(model, t_mask_list, s_feat_list, w_feat_list, v_mask_list, f_feat_list, p_feat_list, split_batch=8):
 
     sim_matrix = []
+    device = next(model.parameters()).device
 
     batch_t_mask = torch.split(t_mask_list, split_batch)
     batch_s_feat = torch.split(s_feat_list, split_batch)
@@ -339,10 +345,21 @@ def _run_on_single_gpu(model, t_mask_list, s_feat_list, w_feat_list, v_mask_list
     batch_p_feat = list(zip(*[torch.split(p, split_batch) for p in p_feat_list]))
 
     with torch.no_grad():
+        # MPP is deterministic in eval mode, so process each video chunk once
+        # and reuse the refined patch features across all text chunks.
+        batch_p_feat_proc = []
+        for p_feat in tqdm(batch_p_feat, desc="MPP refine"):
+            p_feat = [p.to(device) for p in p_feat]
+            batch_p_feat_proc.append(model.PatchListProcessing(p_feat))
+
         for idx1, (t_mask, s_feat, w_feat) in tqdm(enumerate(zip(batch_t_mask, batch_s_feat, batch_w_feat))):
+            t_mask, s_feat, w_feat = t_mask.to(device), s_feat.to(device), w_feat.to(device)
             each_row = []
-            for idx2, (v_mask, f_feat, p_feat) in enumerate(zip(batch_v_mask, batch_f_feat, batch_p_feat)):
-                logits = model.get_similarity_logits(t_mask, s_feat, w_feat, v_mask, list(f_feat), list(p_feat))
+            for idx2, (v_mask, f_feat) in enumerate(zip(batch_v_mask, batch_f_feat)):
+                v_mask = v_mask.to(device)
+                f_feat = [f.to(device, non_blocking=True) for f in f_feat]
+                logits = model.get_similarity_logits(t_mask, s_feat, w_feat, v_mask, list(f_feat),
+                                                     batch_p_feat_proc[idx2], p_feat_processed=True)
                 logits = logits.cpu().detach().numpy()
                 each_row.append(logits)
             each_row = np.concatenate(each_row, axis=-1)
@@ -387,13 +404,13 @@ def eval_epoch(args, model, test_dataloader, device):
 
             s_feat, w_feat, f_feat, p_feat = model.get_text_video_feat(text, text_mask, video, video_mask)
 
-            local_s_feat_list.append(s_feat)
-            local_w_feat_list.append(w_feat)
-            local_t_mask_list.append(text_mask)
-            local_f_feat_list.append(f_feat)
-            local_p_feat_list.append(p_feat)
-            local_v_mask_list.append(video_mask)
-            local_inds_list.append(inds)
+            local_s_feat_list.append(s_feat.detach().cpu())
+            local_w_feat_list.append(w_feat.detach().cpu())
+            local_t_mask_list.append(text_mask.cpu())
+            local_f_feat_list.append([x.detach().cpu() for x in f_feat])
+            local_p_feat_list.append([x.detach().cpu() for x in p_feat])
+            local_v_mask_list.append(video_mask.cpu())
+            local_inds_list.append(inds.cpu())
 
     synchronize()
     def cat_(lst): return torch.cat(lst, dim=0) if len(lst) > 0 else None
@@ -504,12 +521,6 @@ def eval_epoch(args, model, test_dataloader, device):
     if is_main_process():
         logger.info("Similarity computation finished. Gathering and finalizing results.")
         
-        # 过滤掉空块并拼接
-        gathered_chunks = [chunk for chunk in gathered_chunks if chunk is not None and chunk.shape[0] > 0]
-        if not gathered_chunks:
-            logger.error("No similarity chunks were gathered. Cannot compute metrics.")
-            return 0.0
-            
         sim_matrix = _run_on_single_gpu(
             model,
             t_mask_all, s_feat_all, w_feat_all,
@@ -734,13 +745,15 @@ def main():
             logger.info(f"Resumed from epoch {start_epoch}, global step {global_step}, best score {best_score}")
 
             logger.info("Performing an evaluation on the resumed model before continuing training...")
-            if torch.cuda.is_available():
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
                 temp_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+            else:
+                temp_model = model
             eval_epoch(args, temp_model, test_dataloader, args.device)
             synchronize()
             del temp_model 
         
-        if torch.cuda.is_available():
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank,
                                                               find_unused_parameters=True)
         logger.info("Model begins to training...")        
@@ -762,10 +775,11 @@ def main():
             synchronize()
 
             if args.local_rank == 0:
+                model_to_save = model.module if hasattr(model, 'module') else model
                 checkpoint_state = {
                     'epoch': epoch + 1,
                     'global_step': global_step,
-                    'state_dict': model.module.state_dict(),
+                    'state_dict': model_to_save.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'best_score': best_score,
                 }
@@ -794,7 +808,7 @@ def main():
         toc = time.time() - tic
         training_time = time.strftime("%Hh %Mmin %Ss", time.gmtime(toc))
         logger.info("*" * 20 + '\n' + f'training finished with {training_time}' + "*" * 20 + '\n')
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
         best_state = torch.load(join(args.output_dir, 'best.pth'), map_location='cpu')
         if hasattr(model, 'module'):

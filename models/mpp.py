@@ -20,6 +20,7 @@ class PatchProcessing(nn.Module):
             PatchBranch(embed_dim, sample_ratio, num_heads, k)
             for _ in range(num_blocks)
         ])
+        self.grad_ckpt = False
 
     def forward(self, x_list):
         out_list = []
@@ -39,7 +40,10 @@ class PatchProcessing(nn.Module):
             }
 
             for block in self.blocks:
-                token_dict = block(token_dict)
+                if self.grad_ckpt and self.training:
+                    token_dict = torch.utils.checkpoint.checkpoint(block, token_dict, use_reentrant=False)
+                else:
+                    token_dict = block(token_dict)
 
             out_list.append(token_dict['x'])
 
