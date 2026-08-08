@@ -488,25 +488,25 @@ class CLIP(nn.Module):
         return logits_per_image, logits_per_text
 
 
-def convert_weights(model: nn.Module):
-    """Convert applicable model parameters to fp16"""
+def convert_weights(model: nn.Module, dtype: torch.dtype = torch.float16):
+    """Convert applicable model parameters to the given low-precision dtype (fp16 or bf16)"""
 
-    def _convert_weights_to_fp16(l):
+    def _convert_weights(l):
         if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear)):
-            l.weight.data = l.weight.data.half()
+            l.weight.data = l.weight.data.to(dtype)
             if l.bias is not None:
-                l.bias.data = l.bias.data.half()
+                l.bias.data = l.bias.data.to(dtype)
 
         if isinstance(l, nn.MultiheadAttention):
             for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
                 tensor = getattr(l, attr)
                 if tensor is not None:
-                    tensor.data = tensor.data.half()
+                    tensor.data = tensor.data.to(dtype)
 
         for name in ["text_projection", "proj"]:
             if hasattr(l, name):
                 attr = getattr(l, name)
                 if attr is not None:
-                    attr.data = attr.data.half()
+                    attr.data = attr.data.to(dtype)
 
-    model.apply(_convert_weights_to_fp16)
+    model.apply(_convert_weights)

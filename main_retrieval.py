@@ -92,6 +92,8 @@ def get_args(description='Text-Video Retrieval.'):
                             help="The checkpoint file path to resume training from.")
     parser.add_argument('--grad_ckpt', type=int, default=0,
                         help="Enable gradient checkpointing for visual transformer and MPP to save memory.")
+    parser.add_argument('--clip_dtype', type=str, default='fp16', choices=['fp16', 'bf16'],
+                        help="Low-precision dtype for CLIP weights. bf16 avoids fp16 overflow for deep backbones (ViT-L).")
     args = parser.parse_args()
     args.layer_list = [int(x) for x in args.layer_list.split(",") if x.strip() != ""]
     return args
@@ -264,6 +266,12 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         text, text_mask, video, video_mask, idx, _ = batch
         loss = model(text, text_mask, video, video_mask, idx, global_step)
 
+        if not torch.isfinite(loss):
+            logger.warning("Non-finite loss at iteration %d, skipping backward and optimizer step", global_step)
+            optimizer.zero_grad()
+            end = time.time()
+            continue
+
         # if n_gpu > 1:
         #     loss = loss.mean()
 
@@ -349,15 +357,15 @@ def _run_on_single_gpu(model, t_mask_list, s_feat_list, w_feat_list, v_mask_list
         # and reuse the refined patch features across all text chunks.
         batch_p_feat_proc = []
         for p_feat in tqdm(batch_p_feat, desc="MPP refine"):
-            p_feat = [p.to(device) for p in p_feat]
+            p_feat = [p.to(device).float() for p in p_feat]
             batch_p_feat_proc.append(model.PatchListProcessing(p_feat))
 
         for idx1, (t_mask, s_feat, w_feat) in tqdm(enumerate(zip(batch_t_mask, batch_s_feat, batch_w_feat))):
-            t_mask, s_feat, w_feat = t_mask.to(device), s_feat.to(device), w_feat.to(device)
+            t_mask, s_feat, w_feat = t_mask.to(device), s_feat.to(device).float(), w_feat.to(device).float()
             each_row = []
             for idx2, (v_mask, f_feat) in enumerate(zip(batch_v_mask, batch_f_feat)):
                 v_mask = v_mask.to(device)
-                f_feat = [f.to(device, non_blocking=True) for f in f_feat]
+                f_feat = [f.to(device, non_blocking=True).float() for f in f_feat]
                 logits = model.get_similarity_logits(t_mask, s_feat, w_feat, v_mask, list(f_feat),
                                                      batch_p_feat_proc[idx2], p_feat_processed=True)
                 logits = logits.cpu().detach().numpy()
@@ -404,43 +412,62 @@ def eval_epoch(args, model, test_dataloader, device):
 
             s_feat, w_feat, f_feat, p_feat = model.get_text_video_feat(text, text_mask, video, video_mask)
 
-            local_s_feat_list.append(s_feat.detach().cpu())
-            local_w_feat_list.append(w_feat.detach().cpu())
+            # Features come from an fp16/bf16 backbone, so storing them in fp16 on CPU
+            # is lossless and halves the (large) CPU memory footprint for deep backbones.
+            local_s_feat_list.append(s_feat.detach().cpu().half())
+            local_w_feat_list.append(w_feat.detach().cpu().half())
             local_t_mask_list.append(text_mask.cpu())
-            local_f_feat_list.append([x.detach().cpu() for x in f_feat])
-            local_p_feat_list.append([x.detach().cpu() for x in p_feat])
+            local_f_feat_list.append([x.detach().cpu().half() for x in f_feat])
+            local_p_feat_list.append([x.detach().cpu().half() for x in p_feat])
             local_v_mask_list.append(video_mask.cpu())
             local_inds_list.append(inds.cpu())
 
     synchronize()
-    def cat_(lst): return torch.cat(lst, dim=0) if len(lst) > 0 else None
-    s_feat_local = cat_(local_s_feat_list)
-    w_feat_local = cat_(local_w_feat_list)
-    t_mask_local = cat_(local_t_mask_list)
-    v_mask_local = cat_(local_v_mask_list)
-    inds_local   = cat_(local_inds_list)
+    def cat_free_(lst):
+        if len(lst) == 0:
+            return None
+        out = torch.cat(lst, dim=0)
+        lst.clear()
+        return out
+    s_feat_local = cat_free_(local_s_feat_list)
+    w_feat_local = cat_free_(local_w_feat_list)
+    t_mask_local = cat_free_(local_t_mask_list)
+    v_mask_local = cat_free_(local_v_mask_list)
+    inds_local   = cat_free_(local_inds_list)
     # === Step 2: 使用all_gather在所有GPU上同步完整的特征张量 ===
     # 这样每个GPU都拥有了整个测试集的数据，为并行计算做准备
     if len(local_f_feat_list) > 0:
-        f_feat_by_layer_local = list(zip(*local_f_feat_list))  # list[tensor(B, F, D)]
-        p_feat_by_layer_local = list(zip(*local_p_feat_list))
+        f_by_layer = [[local_f_feat_list[b][l] for b in range(len(local_f_feat_list))]
+                      for l in range(len(local_f_feat_list[0]))]
+        p_by_layer = [[local_p_feat_list[b][l] for b in range(len(local_p_feat_list))]
+                      for l in range(len(local_p_feat_list[0]))]
+        local_f_feat_list.clear()
+        local_p_feat_list.clear()
     else:
-        f_feat_by_layer_local, p_feat_by_layer_local = [], []
+        f_by_layer, p_by_layer = [], []
     s_feat_all = allgather(s_feat_local, args)
     w_feat_all = allgather(w_feat_local, args)
     t_mask_all = allgather(t_mask_local, args)
     v_mask_all = allgather(v_mask_local, args)
     inds_all   = allgather(inds_local, args).view(-1)  # [N]
 
-    f_feat_all_layers = [allgather(torch.cat(layer, dim=0), args) for layer in f_feat_by_layer_local] if f_feat_by_layer_local else []
-    p_feat_all_layers = [allgather(torch.cat(layer, dim=0), args) for layer in p_feat_by_layer_local] if p_feat_by_layer_local else []
     order = torch.argsort(inds_all)
+    # Concatenate and reorder one layer at a time, freeing batch tensors as we go,
+    # to keep peak CPU memory low (critical for deep backbones like ViT-L/14).
+    f_feat_all_layers = []
+    for layer in f_by_layer:
+        t = allgather(torch.cat(layer, dim=0), args)
+        layer.clear()
+        f_feat_all_layers.append(t[order])
+    p_feat_all_layers = []
+    for layer in p_by_layer:
+        t = allgather(torch.cat(layer, dim=0), args)
+        layer.clear()
+        p_feat_all_layers.append(t[order])
     s_feat_all = s_feat_all[order]
     w_feat_all = w_feat_all[order]
     t_mask_all = t_mask_all[order]
     v_mask_all = v_mask_all[order]
-    f_feat_all_layers = [x[order] for x in f_feat_all_layers]
-    p_feat_all_layers = [x[order] for x in p_feat_all_layers]
 
     synchronize()
     # --- Text Features ---

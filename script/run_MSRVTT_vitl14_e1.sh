@@ -26,4 +26,5 @@ $PYTHON_ENV/python main_retrieval.py \
 --base_encoder ViT-L/14 \
 --layer_list 0,11,23 \
 --grad_ckpt 1 \
+--clip_dtype bf16 \
 --output_dir experiments/MSRVTT

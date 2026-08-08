@@ -62,7 +62,8 @@ class MyModel(nn.Module):
                          layer_list=getattr(config, 'layer_list', None))
 
         if torch.cuda.is_available():
-            convert_weights(self.clip)
+            clip_dtype = torch.bfloat16 if getattr(config, 'clip_dtype', 'fp16') == 'bf16' else torch.float16
+            convert_weights(self.clip, dtype=clip_dtype)
 
         cross_config = SimpleNamespace(**{
             "attention_probs_dropout_prob": 0.1,
