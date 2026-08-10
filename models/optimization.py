@@ -123,10 +123,13 @@ class BertAdam(Optimizer):
                 # State initialization
                 if len(state) == 0:
                     state['step'] = 0
-                    # Exponential moving average of gradient values
-                    state['next_m'] = torch.zeros_like(p.data)
+                    # Exponential moving average of gradient values.
+                    # Kept in fp32 even for fp16/bf16 params: low-precision momentum
+                    # (esp. bf16's 8-bit mantissa) rounds away the tiny CLIP-backbone
+                    # gradient accumulations and destabilizes training.
+                    state['next_m'] = torch.zeros_like(p.data, dtype=torch.float32)
                     # Exponential moving average of squared gradient values
-                    state['next_v'] = torch.zeros_like(p.data)
+                    state['next_v'] = torch.zeros_like(p.data, dtype=torch.float32)
 
                 next_m, next_v = state['next_m'], state['next_v']
                 beta1, beta2 = group['b1'], group['b2']
@@ -135,6 +138,8 @@ class BertAdam(Optimizer):
                 if group['max_grad_norm'] > 0:
                     clip_grad_norm_(p, group['max_grad_norm'])
 
+                # Accumulate moments in fp32
+                grad = grad.to(torch.float32)
                 # Decay the first and second moment running average coefficient
                 # In-place operations to update the averages at the same time
                 # next_m.mul_(beta1).add_(1 - beta1, grad) --> pytorch 1.7
@@ -151,7 +156,7 @@ class BertAdam(Optimizer):
                 # with the m/v parameters. This is equivalent to adding the square
                 # of the weights to the loss with plain (non-momentum) SGD.
                 if group['weight_decay'] > 0.0:
-                    update += group['weight_decay'] * p.data
+                    update = update + group['weight_decay'] * p.data.to(torch.float32)
 
                 if group['t_total'] != -1:
                     schedule_fct = SCHEDULES[group['schedule']]
@@ -161,7 +166,7 @@ class BertAdam(Optimizer):
                     lr_scheduled = group['lr']
 
                 update_with_lr = lr_scheduled * update
-                p.data.add_(-update_with_lr)
+                p.data.add_(update_with_lr.to(p.data.dtype), alpha=-1.0)
 
                 state['step'] += 1
 
