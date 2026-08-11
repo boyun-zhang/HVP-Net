@@ -353,12 +353,17 @@ def _run_on_single_gpu(model, t_mask_list, s_feat_list, w_feat_list, v_mask_list
     batch_p_feat = list(zip(*[torch.split(p, split_batch) for p in p_feat_list]))
 
     with torch.no_grad():
-        # MPP is deterministic in eval mode, so process each video chunk once
-        # and reuse the refined patch features across all text chunks.
+        # Process each video chunk once and reuse the refined patch features
+        # across all text chunks (MPP is stochastic, caching one draw also
+        # removes eval noise).
         batch_p_feat_proc = []
         for p_feat in tqdm(batch_p_feat, desc="MPP refine"):
             p_feat = [p.to(device).float() for p in p_feat]
             batch_p_feat_proc.append(model.PatchListProcessing(p_feat))
+
+        # The 'bw' word-patch weighting needs the word weights of each video's
+        # paired caption, i.e. of text chunk idx2, not of the query chunk.
+        batch_w_feat_w = [model.w_feat_w(w.to(device).float()).squeeze(-1) for w in batch_w_feat]
 
         for idx1, (t_mask, s_feat, w_feat) in tqdm(enumerate(zip(batch_t_mask, batch_s_feat, batch_w_feat))):
             t_mask, s_feat, w_feat = t_mask.to(device), s_feat.to(device).float(), w_feat.to(device).float()
@@ -367,7 +372,8 @@ def _run_on_single_gpu(model, t_mask_list, s_feat_list, w_feat_list, v_mask_list
                 v_mask = v_mask.to(device)
                 f_feat = [f.to(device, non_blocking=True).float() for f in f_feat]
                 logits = model.get_similarity_logits(t_mask, s_feat, w_feat, v_mask, list(f_feat),
-                                                     batch_p_feat_proc[idx2], p_feat_processed=True)
+                                                     batch_p_feat_proc[idx2], p_feat_processed=True,
+                                                     w_feat_w=batch_w_feat_w[idx2])
                 logits = logits.cpu().detach().numpy()
                 each_row.append(logits)
             each_row = np.concatenate(each_row, axis=-1)

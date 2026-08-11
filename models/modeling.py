@@ -307,7 +307,7 @@ class MyModel(nn.Module):
         return s_feat.squeeze(1), w_feat, f_feat_list, p_feat_list
 
     def get_similarity_logits(self, text_mask, s_feat, w_feat, video_mask, f_feat_list, p_feat_list, shaped=False,
-                              p_feat_processed=False):
+                              p_feat_processed=False, w_feat_w=None):
         if shaped is False:
             text_mask = text_mask.view(-1, text_mask.shape[-1])
             video_mask = video_mask.view(-1, video_mask.shape[-1])
@@ -317,7 +317,11 @@ class MyModel(nn.Module):
         if not p_feat_processed:
             p_feat_list = self.PatchListProcessing(p_feat_list)
         # w_feat & p_feat_list
-        w_feat_w = self.w_feat_w(w_feat).squeeze(-1)
+        # The 'bw' weighting needs the word weights of the VIDEO side's paired
+        # caption. In chunked evaluation that is a different text chunk than the
+        # query side, so callers may pass it explicitly.
+        if w_feat_w is None:
+            w_feat_w = self.w_feat_w(w_feat).squeeze(-1)
         for p_feat in p_feat_list:
             p_feat_w = self.p_feat_w(p_feat).squeeze(-1)
             sims_wp = torch.einsum('awd,bpd->abwp', [self.norm(w_feat), self.norm(p_feat)])
